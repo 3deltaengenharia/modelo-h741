@@ -33,6 +33,7 @@ let ifcApi = null;
 let ifcModelID = null;
 let selectedExpressID = null;
 let selectionHelper = null;
+let ifcInfoByExpressID = new Map();
 let modelAxes = { x: new THREE.Vector3(1,0,0), y: new THREE.Vector3(0,1,0), z: new THREE.Vector3(0,0,1) };
 
 const raycaster = new THREE.Raycaster();
@@ -227,6 +228,61 @@ function projectBoundsOntoAxis(axisVec){
 
 
 // ---------- INSPEÇÃO IFC ----------
+
+function splitIfcArgs(s){
+  const out=[]; let cur="", depth=0, inStr=false;
+  for(let i=0;i<s.length;i++){
+    const ch=s[i];
+    if(ch==="'"){
+      cur+=ch;
+      if(inStr && s[i+1]==="'"){ cur+="'"; i++; continue; }
+      inStr=!inStr; continue;
+    }
+    if(!inStr){
+      if(ch==='(') depth++;
+      else if(ch===')') depth--;
+      else if(ch===',' && depth===0){ out.push(cur.trim()); cur=""; continue; }
+    }
+    cur+=ch;
+  }
+  out.push(cur.trim());
+  return out;
+}
+
+function decodeIfcText(v){
+  if(!v || v==='$') return "";
+  let s=String(v).trim();
+  if(s.startsWith("'") && s.endsWith("'")) s=s.slice(1,-1).replace(/''/g,"'");
+  // Decodificação básica de sequências IFC \X\hh (Latin-1), comum em exports brasileiros.
+  s=s.replace(/\\X\\([0-9A-Fa-f]{2})/g,(_,h)=>String.fromCharCode(parseInt(h,16)));
+  return s;
+}
+
+function parseIfcElementInfo(bytes){
+  const map=new Map();
+  try{
+    const txt=new TextDecoder('utf-8').decode(bytes);
+    const lines=txt.split(/;\s*(?:\r?\n)?/);
+    for(const raw of lines){
+      const m=raw.match(/^\s*#(\d+)\s*=\s*(IFC[A-Z0-9_]+)\s*\((.*)\)\s*$/is);
+      if(!m) continue;
+      const id=Number(m[1]), type=m[2].toUpperCase();
+      // Só indexamos entidades que podem ser clicadas/renderizadas como produtos.
+      // Os primeiros campos de IfcRoot/IfcObject/IfcProduct são estáveis entre IFC2x3/IFC4.
+      const args=splitIfcArgs(m[3]);
+      if(args.length < 3) continue;
+      const globalId=decodeIfcText(args[0]);
+      const name=decodeIfcText(args[2]);
+      const description=decodeIfcText(args[3]);
+      const objectType=decodeIfcText(args[4]);
+      const tag=decodeIfcText(args[7]);
+      const predefinedType=decodeIfcText(args[8]).replace(/^\.|\.$/g,'');
+      map.set(id,{expressID:id,typeName:type,globalId,name,description,objectType,tag,predefinedType});
+    }
+  }catch(e){ console.warn('Não foi possível pré-indexar os nomes IFC',e); }
+  return map;
+}
+
 const IFC_LABELS_PT = {
   IFCBEAM: "Viga",
   IFCBEAMSTANDARDCASE: "Viga",
@@ -338,25 +394,43 @@ function addInfoRow(rows,label,value){
 function inspectIfcElement(hit){
   if(!hit?.object) return;
   const expressID = hit.object.userData?.expressID;
-  if(expressID == null || !ifcApi || ifcModelID == null) return;
+  if(expressID == null) return;
   try{
-    const line = ifcApi.GetLine(ifcModelID, expressID, true);
-    if(!line) return;
+    let info = ifcInfoByExpressID.get(Number(expressID));
+    // Fallback para Web-IFC, caso o item não tenha sido encontrado no texto bruto.
+    if(!info && ifcApi && ifcModelID != null){
+      const line = ifcApi.GetLine(ifcModelID, expressID, true);
+      if(line){
+        const typeName=getIfcTypeName(line);
+        info={
+          expressID,
+          typeName,
+          name:rawIfcValue(line.Name),
+          description:rawIfcValue(line.Description),
+          objectType:rawIfcValue(line.ObjectType),
+          tag:rawIfcValue(line.Tag),
+          predefinedType:rawIfcValue(line.PredefinedType),
+          globalId:rawIfcValue(line.GlobalId)
+        };
+      }
+    }
+    if(!info) info={expressID,typeName:'ELEMENTO IFC',name:`Elemento #${expressID}`};
+
     selectedExpressID = expressID;
     showSelectionHelper(expressID);
-    const typeName = getIfcTypeName(line);
+    const typeName = String(info.typeName || 'ELEMENTO IFC').toUpperCase();
     const ptType = IFC_LABELS_PT[typeName] || typeName.replace(/^IFC/,"");
-    const name = rawIfcValue(line.Name) || rawIfcValue(line.LongName) || `${ptType} #${expressID}`;
+    const name = info.name || `${ptType} #${expressID}`;
     const panel = ensureInfoPanel();
     panel.querySelector("#ifc-info-title").textContent = name;
     const rows=[];
     addInfoRow(rows,"Tipo",`${ptType}${typeName && typeName!==ptType ? ` (${typeName})` : ""}`);
-    addInfoRow(rows,"Nome IFC",rawIfcValue(line.Name));
-    addInfoRow(rows,"Descrição",rawIfcValue(line.Description));
-    addInfoRow(rows,"Objeto",rawIfcValue(line.ObjectType));
-    addInfoRow(rows,"Tag",rawIfcValue(line.Tag));
-    addInfoRow(rows,"Pré-definição",rawIfcValue(line.PredefinedType));
-    addInfoRow(rows,"GlobalId",rawIfcValue(line.GlobalId));
+    addInfoRow(rows,"Nome IFC",info.name);
+    addInfoRow(rows,"Descrição",info.description);
+    addInfoRow(rows,"Objeto",info.objectType);
+    addInfoRow(rows,"Tag",info.tag);
+    addInfoRow(rows,"Pré-definição",info.predefinedType);
+    addInfoRow(rows,"GlobalId",info.globalId);
     addInfoRow(rows,"Express ID",`#${expressID}`);
     panel.querySelector("#ifc-info-grid").innerHTML = rows.join("");
     panel.classList.add("show");
@@ -515,6 +589,7 @@ async function boot(){
     setStatus("busy","Carregando"); setProgress(4,"Preparando visualizador…");
     initThree(); ensureInfoPanel();
     const bytes=await fetchIfc();
+    ifcInfoByExpressID = parseIfcElementInfo(bytes);
     declaredIfcUnitScale = detectLengthUnit(bytes);
     // O Web-IFC já entrega a geometria em escala SI (metros).
     // Por isso a medição deve usar 1 unidade = 1 metro no visualizador.
@@ -534,11 +609,13 @@ async function boot(){
       }
       const t=Number(total)||1; const x=Number(index)||0; setProgress(45+Math.min(1,(x+1)/t)*47,`Montando modelo 3D… ${Math.min(100,Math.round((x+1)/t*100))}%`);
     });
-    // Mantém o modelo IFC aberto para consulta das propriedades ao clicar nos elementos.
+    // Os nomes/tipos já foram indexados do próprio arquivo IFC; podemos fechar o modelo Web-IFC.
+    try{ ifcApi.CloseModel(ifcModelID); }catch(e){}
+    ifcModelID = null;
     if(!count) throw new Error("O IFC foi lido, mas nenhuma geometria 3D foi encontrada.");
     setProgress(94,"Enquadrando modelo…");
     modelRoot.updateMatrixWorld(true); modelBox=new THREE.Box3().setFromObject(modelRoot); computeModelAxes(); fit("iso");
-    modelMeta.textContent=`Estrutura • ${count.toLocaleString("pt-BR")} componentes 3D • corte IFC + medição`;
+    modelMeta.textContent=`Estrutura • ${count.toLocaleString("pt-BR")} componentes 3D • clique no elemento para ver nome IFC`;
     setProgress(100,"Modelo pronto"); setStatus("ok","Modelo pronto");
     setTimeout(()=>loader.classList.add("hidden"),250); setTimeout(()=>hint.classList.add("hide"),7000);
   }catch(e){
