@@ -29,6 +29,10 @@ let modelMeshes = [];
 let allMaterials = new Set();
 let metersPerModelUnit = 1;
 let declaredIfcUnitScale = 1;
+let ifcApi = null;
+let ifcModelID = null;
+let selectedExpressID = null;
+let selectionHelper = null;
 let modelAxes = { x: new THREE.Vector3(1,0,0), y: new THREE.Vector3(0,1,0), z: new THREE.Vector3(0,0,1) };
 
 const raycaster = new THREE.Raycaster();
@@ -221,6 +225,146 @@ function projectBoundsOntoAxis(axisVec){
   return { min, max };
 }
 
+
+// ---------- INSPEÇÃO IFC ----------
+const IFC_LABELS_PT = {
+  IFCBEAM: "Viga",
+  IFCBEAMSTANDARDCASE: "Viga",
+  IFCSLAB: "Laje",
+  IFCSLABSTANDARDCASE: "Laje",
+  IFCCOLUMN: "Pilar",
+  IFCCOLUMNSTANDARDCASE: "Pilar",
+  IFCWALL: "Parede",
+  IFCWALLSTANDARDCASE: "Parede",
+  IFCFOOTING: "Fundação",
+  IFCPILE: "Estaca",
+  IFCMEMBER: "Barra / membro",
+  IFCPLATE: "Placa",
+  IFCSTAIR: "Escada",
+  IFCSTAIRFLIGHT: "Lance de escada",
+  IFCRAMP: "Rampa",
+  IFCRAMPFLIGHT: "Lance de rampa",
+  IFCROOF: "Cobertura",
+  IFCDOOR: "Porta",
+  IFCWINDOW: "Janela",
+  IFCCURTAINWALL: "Fachada cortina",
+  IFCBUILDINGELEMENTPROXY: "Elemento",
+  IFCREINFORCINGBAR: "Armadura",
+  IFCREINFORCINGMESH: "Tela de armadura",
+  IFCSPACE: "Ambiente",
+  IFCOPENINGELEMENT: "Abertura"
+};
+
+function rawIfcValue(v){
+  if(v == null) return "";
+  if(typeof v === "string" || typeof v === "number" || typeof v === "boolean") return String(v);
+  if(typeof v === "object"){
+    if("value" in v && v.value != null) return String(v.value);
+    if("Name" in v) return rawIfcValue(v.Name);
+  }
+  return "";
+}
+
+function getIfcTypeName(line){
+  let typeName = "";
+  try{
+    if(ifcApi && typeof ifcApi.GetNameFromTypeCode === "function" && line?.type != null){
+      typeName = ifcApi.GetNameFromTypeCode(line.type) || "";
+    }
+  }catch(e){ /* fallback abaixo */ }
+  if(!typeName && line?.constructor?.name && !/^Object$/i.test(line.constructor.name)) typeName = line.constructor.name;
+  typeName = String(typeName || "Elemento IFC").toUpperCase().replace(/^WEBIFC\./,"");
+  return typeName;
+}
+
+function ensureInfoPanel(){
+  let panel = document.getElementById("ifc-info-panel");
+  if(panel) return panel;
+  const style = document.createElement("style");
+  style.textContent = `
+    #ifc-info-panel{position:absolute;right:18px;top:86px;z-index:25;width:min(360px,calc(100% - 36px));background:rgba(255,255,255,.97);border:1px solid rgba(0,0,0,.08);border-radius:16px;box-shadow:0 14px 34px rgba(0,0,0,.16);padding:15px 16px;display:none;font-family:inherit;color:#282828;backdrop-filter:blur(10px)}
+    #ifc-info-panel.show{display:block}
+    #ifc-info-panel .ifc-head{display:flex;gap:12px;align-items:flex-start;justify-content:space-between;margin-bottom:8px}
+    #ifc-info-panel .ifc-kicker{font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#ff6500;margin-bottom:4px}
+    #ifc-info-panel .ifc-title{font-size:16px;font-weight:800;line-height:1.2;word-break:break-word}
+    #ifc-info-panel .ifc-close{border:0;background:#f1f1f1;border-radius:9px;width:30px;height:30px;cursor:pointer;font-size:18px;line-height:28px;color:#555}
+    #ifc-info-panel .ifc-grid{display:grid;grid-template-columns:92px 1fr;gap:7px 10px;font-size:12px;border-top:1px solid #eee;padding-top:10px}
+    #ifc-info-panel .ifc-label{color:#777;font-weight:700}
+    #ifc-info-panel .ifc-value{color:#222;font-weight:600;min-width:0;overflow-wrap:anywhere}
+    #ifc-info-panel .ifc-hint{font-size:10px;color:#8a8a8a;margin-top:10px;line-height:1.35}
+    @media(max-width:700px){#ifc-info-panel{left:12px;right:12px;top:auto;bottom:92px;width:auto;max-height:42vh;overflow:auto;border-radius:14px}}
+  `;
+  document.head.appendChild(style);
+  panel = document.createElement("div");
+  panel.id = "ifc-info-panel";
+  panel.innerHTML = `
+    <div class="ifc-head">
+      <div><div class="ifc-kicker">Elemento IFC</div><div class="ifc-title" id="ifc-info-title">Elemento</div></div>
+      <button class="ifc-close" id="ifc-info-close" aria-label="Fechar">×</button>
+    </div>
+    <div class="ifc-grid" id="ifc-info-grid"></div>
+    <div class="ifc-hint">Clique/toque em outro elemento para consultar seus dados IFC.</div>
+  `;
+  viewer.appendChild(panel);
+  panel.querySelector("#ifc-info-close").addEventListener("click",()=>clearIfcSelection());
+  return panel;
+}
+
+function clearIfcSelection(){
+  selectedExpressID = null;
+  const panel = document.getElementById("ifc-info-panel");
+  panel?.classList.remove("show");
+  if(selectionHelper){ scene.remove(selectionHelper); selectionHelper.geometry?.dispose?.(); selectionHelper.material?.dispose?.(); selectionHelper=null; }
+}
+
+function showSelectionHelper(expressID){
+  if(selectionHelper){ scene.remove(selectionHelper); selectionHelper.geometry?.dispose?.(); selectionHelper.material?.dispose?.(); selectionHelper=null; }
+  const selected = modelMeshes.filter(m=>m.userData?.expressID===expressID);
+  if(!selected.length) return;
+  const box = new THREE.Box3();
+  for(const mesh of selected) box.expandByObject(mesh);
+  if(box.isEmpty()) return;
+  selectionHelper = new THREE.Box3Helper(box, 0xff6a00);
+  selectionHelper.renderOrder = 1000;
+  scene.add(selectionHelper);
+}
+
+function addInfoRow(rows,label,value){
+  const v = String(value ?? "").trim();
+  if(!v || v === "$" || v.toUpperCase() === "NOTDEFINED") return;
+  rows.push(`<div class="ifc-label">${label}</div><div class="ifc-value">${v.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}</div>`);
+}
+
+function inspectIfcElement(hit){
+  if(!hit?.object) return;
+  const expressID = hit.object.userData?.expressID;
+  if(expressID == null || !ifcApi || ifcModelID == null) return;
+  try{
+    const line = ifcApi.GetLine(ifcModelID, expressID, true);
+    if(!line) return;
+    selectedExpressID = expressID;
+    showSelectionHelper(expressID);
+    const typeName = getIfcTypeName(line);
+    const ptType = IFC_LABELS_PT[typeName] || typeName.replace(/^IFC/,"");
+    const name = rawIfcValue(line.Name) || rawIfcValue(line.LongName) || `${ptType} #${expressID}`;
+    const panel = ensureInfoPanel();
+    panel.querySelector("#ifc-info-title").textContent = name;
+    const rows=[];
+    addInfoRow(rows,"Tipo",`${ptType}${typeName && typeName!==ptType ? ` (${typeName})` : ""}`);
+    addInfoRow(rows,"Nome IFC",rawIfcValue(line.Name));
+    addInfoRow(rows,"Descrição",rawIfcValue(line.Description));
+    addInfoRow(rows,"Objeto",rawIfcValue(line.ObjectType));
+    addInfoRow(rows,"Tag",rawIfcValue(line.Tag));
+    addInfoRow(rows,"Pré-definição",rawIfcValue(line.PredefinedType));
+    addInfoRow(rows,"GlobalId",rawIfcValue(line.GlobalId));
+    addInfoRow(rows,"Express ID",`#${expressID}`);
+    panel.querySelector("#ifc-info-grid").innerHTML = rows.join("");
+    panel.classList.add("show");
+  }catch(e){
+    console.warn("Não foi possível ler as propriedades IFC do elemento", e);
+  }
+}
+
 // ---------- CORTE ----------
 function axisVector(axis){
   return modelAxes[axis]?.clone() || new THREE.Vector3(1,0,0);
@@ -336,10 +480,17 @@ function snapToVertex(hit,clientX,clientY){
 }
 
 function onPointerUp(e){
-  if(!measureEnabled || !pointerDown) return;
+  if(!pointerDown) return;
   const moved=Math.hypot(e.clientX-pointerDown.x,e.clientY-pointerDown.y); pointerDown=null;
   if(moved>7) return;
-  const hit=raycastAt(e.clientX,e.clientY); if(!hit) return;
+  const hit=raycastAt(e.clientX,e.clientY);
+  if(!hit) return;
+
+  if(!measureEnabled){
+    inspectIfcElement(hit);
+    return;
+  }
+
   const point=snapToVertex(hit,e.clientX,e.clientY);
   if(!firstMeasurePoint){
     firstMeasurePoint=point; clearTemporaryMarker(); createMarker(point,true);
@@ -362,7 +513,7 @@ function setMeasureEnabled(value){
 async function boot(){
   try{
     setStatus("busy","Carregando"); setProgress(4,"Preparando visualizador…");
-    initThree();
+    initThree(); ensureInfoPanel();
     const bytes=await fetchIfc();
     declaredIfcUnitScale = detectLengthUnit(bytes);
     // O Web-IFC já entrega a geometria em escala SI (metros).
@@ -370,20 +521,20 @@ async function boot(){
     metersPerModelUnit = 1;
     unitNote.textContent = unitDescription();
     setProgress(37,"Inicializando leitor IFC…");
-    const ifcApi=new IfcAPI(); ifcApi.SetWasmPath(WASM_PATH,true); await ifcApi.Init();
+    ifcApi=new IfcAPI(); ifcApi.SetWasmPath(WASM_PATH,true); await ifcApi.Init();
     setProgress(43,"Lendo estrutura IFC…");
-    const modelID=ifcApi.OpenModel(bytes,{COORDINATE_TO_ORIGIN:true,USE_FAST_BOOLS:true});
+    ifcModelID=ifcApi.OpenModel(bytes,{COORDINATE_TO_ORIGIN:true,USE_FAST_BOOLS:true});
     const geometryCache=new Map(); const materialCache=new Map(); let count=0;
-    ifcApi.StreamAllMeshes(modelID,(flatMesh,index,total)=>{
+    ifcApi.StreamAllMeshes(ifcModelID,(flatMesh,index,total)=>{
       const geoms=flatMesh.geometries;
       for(let i=0;i<geoms.size();i++){
-        const placed=geoms.get(i); const geo=geometryFromIfc(ifcApi,modelID,placed.geometryExpressID,geometryCache); if(!geo)continue;
+        const placed=geoms.get(i); const geo=geometryFromIfc(ifcApi,ifcModelID,placed.geometryExpressID,geometryCache); if(!geo)continue;
         const mat=materialFor(placed.color,materialCache); const mesh=new THREE.Mesh(geo,mat);
-        const matrix=new THREE.Matrix4(); matrix.fromArray(placed.flatTransformation); mesh.applyMatrix4(matrix); modelRoot.add(mesh); modelMeshes.push(mesh); count++;
+        const matrix=new THREE.Matrix4(); matrix.fromArray(placed.flatTransformation); mesh.applyMatrix4(matrix); mesh.userData.expressID = flatMesh.expressID; modelRoot.add(mesh); modelMeshes.push(mesh); count++;
       }
       const t=Number(total)||1; const x=Number(index)||0; setProgress(45+Math.min(1,(x+1)/t)*47,`Montando modelo 3D… ${Math.min(100,Math.round((x+1)/t*100))}%`);
     });
-    ifcApi.CloseModel(modelID);
+    // Mantém o modelo IFC aberto para consulta das propriedades ao clicar nos elementos.
     if(!count) throw new Error("O IFC foi lido, mas nenhuma geometria 3D foi encontrada.");
     setProgress(94,"Enquadrando modelo…");
     modelRoot.updateMatrixWorld(true); modelBox=new THREE.Box3().setFromObject(modelRoot); computeModelAxes(); fit("iso");
@@ -416,5 +567,7 @@ document.getElementById("btn-cut-clear").addEventListener("click",clearCut);
 btnMeasure.addEventListener("click",()=>setMeasureEnabled(!measureEnabled));
 document.getElementById("btn-measure-new").addEventListener("click",newMeasurement);
 document.getElementById("btn-measure-clear").addEventListener("click",clearMeasurements);
+
+window.addEventListener("beforeunload",()=>{ try{ if(ifcApi && ifcModelID!=null) ifcApi.CloseModel(ifcModelID); }catch(e){} });
 
 boot();
