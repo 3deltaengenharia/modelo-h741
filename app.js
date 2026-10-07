@@ -28,6 +28,8 @@ let scene, camera, renderer, controls, modelRoot, modelBox;
 let modelMeshes = [];
 let allMaterials = new Set();
 let metersPerModelUnit = 1;
+let declaredIfcUnitScale = 1;
+let modelAxes = { x: new THREE.Vector3(1,0,0), y: new THREE.Vector3(0,1,0), z: new THREE.Vector3(0,0,1) };
 
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
@@ -152,22 +154,80 @@ function formatDistance(modelDistance){
 }
 
 function unitDescription(){
-  if(Math.abs(metersPerModelUnit-0.01)<1e-9) return "IFC em centímetros";
-  if(Math.abs(metersPerModelUnit-0.001)<1e-9) return "IFC em milímetros";
-  if(Math.abs(metersPerModelUnit-1)<1e-9) return "IFC em metros";
-  return "Unidade IFC detectada";
+  const name = Math.abs(declaredIfcUnitScale-0.01)<1e-9 ? "centímetros" :
+               Math.abs(declaredIfcUnitScale-0.001)<1e-9 ? "milímetros" :
+               Math.abs(declaredIfcUnitScale-1)<1e-9 ? "metros" : "unidade personalizada";
+  return `IFC declarado em ${name} • medição corrigida em escala real`;
+}
+
+function computeModelAxes(){
+  // Determina os eixos principais do modelo no plano horizontal (X/Z),
+  // para que o corte acompanhe a orientação do IFC e não o eixo global da cena.
+  const pts = [];
+  for(const mesh of modelMeshes){
+    const pos = mesh.geometry?.attributes?.position;
+    if(!pos) continue;
+    const count = pos.count;
+    const step = Math.max(1, Math.floor(count / 120));
+    for(let i=0; i<count; i+=step){
+      const p = new THREE.Vector3().fromBufferAttribute(pos, i);
+      mesh.localToWorld(p);
+      pts.push([p.x, p.z]);
+    }
+  }
+  if(pts.length < 3){
+    modelAxes = { x:new THREE.Vector3(1,0,0), y:new THREE.Vector3(0,1,0), z:new THREE.Vector3(0,0,1) };
+    return;
+  }
+  let meanX=0, meanZ=0;
+  for(const [x,z] of pts){ meanX += x; meanZ += z; }
+  meanX /= pts.length; meanZ /= pts.length;
+  let sxx=0, szz=0, sxz=0;
+  for(const [x,z] of pts){
+    const dx=x-meanX, dz=z-meanZ;
+    sxx += dx*dx; szz += dz*dz; sxz += dx*dz;
+  }
+  const trace = sxx + szz;
+  const det = sxx*szz - sxz*sxz;
+  const disc = Math.max(0, trace*trace/4 - det);
+  const lambda = trace/2 + Math.sqrt(disc);
+  let dir;
+  if(Math.abs(sxz) > 1e-9) dir = new THREE.Vector2(lambda - szz, sxz).normalize();
+  else dir = sxx >= szz ? new THREE.Vector2(1,0) : new THREE.Vector2(0,1);
+  const xAxis = new THREE.Vector3(dir.x, 0, dir.y).normalize();
+  const yAxis = new THREE.Vector3(0,1,0);
+  const zAxis = new THREE.Vector3().crossVectors(yAxis, xAxis).normalize();
+  modelAxes = { x:xAxis, y:yAxis, z:zAxis };
+}
+
+function projectBoundsOntoAxis(axisVec){
+  if(!modelBox) return { min: 0, max: 1 };
+  const corners = [
+    new THREE.Vector3(modelBox.min.x, modelBox.min.y, modelBox.min.z),
+    new THREE.Vector3(modelBox.min.x, modelBox.min.y, modelBox.max.z),
+    new THREE.Vector3(modelBox.min.x, modelBox.max.y, modelBox.min.z),
+    new THREE.Vector3(modelBox.min.x, modelBox.max.y, modelBox.max.z),
+    new THREE.Vector3(modelBox.max.x, modelBox.min.y, modelBox.min.z),
+    new THREE.Vector3(modelBox.max.x, modelBox.min.y, modelBox.max.z),
+    new THREE.Vector3(modelBox.max.x, modelBox.max.y, modelBox.min.z),
+    new THREE.Vector3(modelBox.max.x, modelBox.max.y, modelBox.max.z),
+  ];
+  let min = Infinity, max = -Infinity;
+  for(const c of corners){
+    const v = axisVec.dot(c);
+    if(v < min) min = v;
+    if(v > max) max = v;
+  }
+  return { min, max };
 }
 
 // ---------- CORTE ----------
 function axisVector(axis){
-  if(axis === "y") return new THREE.Vector3(0,1,0);
-  if(axis === "z") return new THREE.Vector3(0,0,1);
-  return new THREE.Vector3(1,0,0);
+  return modelAxes[axis]?.clone() || new THREE.Vector3(1,0,0);
 }
 
 function boundsForAxis(axis){
-  if(!modelBox) return {min:0,max:1};
-  return {min:modelBox.min[axis], max:modelBox.max[axis]};
+  return projectBoundsOntoAxis(axisVector(axis));
 }
 
 function updateCut(){
@@ -179,8 +239,10 @@ function updateCut(){
   const t = Number(cutSlider.value)/100;
   const {min,max} = boundsForAxis(cutAxis);
   const coordinate = min + (max-min)*t;
-  const normal = axisVector(cutAxis).multiplyScalar(cutInverted ? -1 : 1);
-  cutPlane.set(normal, -normal.dot(axisVector(cutAxis).multiplyScalar(coordinate)));
+  const baseAxis = axisVector(cutAxis);
+  const normal = baseAxis.clone().multiplyScalar(cutInverted ? -1 : 1).normalize();
+  const planePoint = baseAxis.clone().normalize().multiplyScalar(coordinate);
+  cutPlane.setFromNormalAndCoplanarPoint(normal, planePoint);
   for(const m of allMaterials){ m.clippingPlanes = [cutPlane]; m.clipIntersection = false; m.needsUpdate = true; }
   cutNote.textContent = `${cutAxis.toUpperCase()} • ${Math.round(t*100)}%${cutInverted ? " • invertido" : ""}`;
 }
@@ -302,7 +364,11 @@ async function boot(){
     setStatus("busy","Carregando"); setProgress(4,"Preparando visualizador…");
     initThree();
     const bytes=await fetchIfc();
-    metersPerModelUnit=detectLengthUnit(bytes); unitNote.textContent=unitDescription();
+    declaredIfcUnitScale = detectLengthUnit(bytes);
+    // O Web-IFC já entrega a geometria em escala SI (metros).
+    // Por isso a medição deve usar 1 unidade = 1 metro no visualizador.
+    metersPerModelUnit = 1;
+    unitNote.textContent = unitDescription();
     setProgress(37,"Inicializando leitor IFC…");
     const ifcApi=new IfcAPI(); ifcApi.SetWasmPath(WASM_PATH,true); await ifcApi.Init();
     setProgress(43,"Lendo estrutura IFC…");
@@ -320,8 +386,8 @@ async function boot(){
     ifcApi.CloseModel(modelID);
     if(!count) throw new Error("O IFC foi lido, mas nenhuma geometria 3D foi encontrada.");
     setProgress(94,"Enquadrando modelo…");
-    modelRoot.updateMatrixWorld(true); modelBox=new THREE.Box3().setFromObject(modelRoot); fit("iso");
-    modelMeta.textContent=`Estrutura • ${count.toLocaleString("pt-BR")} componentes 3D • corte + medição`;
+    modelRoot.updateMatrixWorld(true); modelBox=new THREE.Box3().setFromObject(modelRoot); computeModelAxes(); fit("iso");
+    modelMeta.textContent=`Estrutura • ${count.toLocaleString("pt-BR")} componentes 3D • corte IFC + medição`;
     setProgress(100,"Modelo pronto"); setStatus("ok","Modelo pronto");
     setTimeout(()=>loader.classList.add("hidden"),250); setTimeout(()=>hint.classList.add("hide"),7000);
   }catch(e){
