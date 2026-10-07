@@ -1,5 +1,8 @@
-import * as THREE from "https://esm.sh/three@0.181.0";
-import * as OBC from "https://esm.sh/@thatopen/components@3.4.9?deps=three@0.181.0";
+import * as THREE from "three";
+// Important: web-ifc is deliberately externalized here. esm.sh may otherwise
+// bundle the Node build of web-ifc, which fails in browsers with the
+// Emscripten "not compiled for this environment" error.
+import * as OBC from "https://esm.sh/@thatopen/components@3.4.9?external=three,web-ifc";
 
 const MODEL_URL = "./modelo.ifc";
 const CACHE_DB = "3delta-bim-cache-v1";
